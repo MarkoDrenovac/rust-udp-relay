@@ -1,321 +1,386 @@
-const dgram = require('dgram');
 const express = require('express');
+const dgram = require('dgram');
 const cors = require('cors');
 
 const app = express();
-app.use(cors());
+const PORT = process.env.PORT || 3000;
+
+// Enable CORS for all origins with specific headers
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-client-info', 'apikey'],
+  credentials: false
+}));
 app.use(express.json());
 
-// Source Query Protocol implementation
+// Add request logging
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  next();
+});
+
 class SourceQuery {
-  static async queryServer(ip, port, timeout = 5000) {
-    return new Promise((resolve) => {
+  constructor(timeout = 5000) {
+    this.timeout = timeout;
+  }
+
+  // A2S_INFO query
+  async getServerInfo(ip, port) {
+    return new Promise((resolve, reject) => {
       const client = dgram.createSocket('udp4');
-      let resolved = false;
-      
-      // Set timeout
-      const timer = setTimeout(() => {
-        if (!resolved) {
-          resolved = true;
-          client.close();
-          resolve({ success: false, error: 'Timeout' });
-        }
-      }, timeout);
+      const timeout = setTimeout(() => {
+        client.close();
+        reject(new Error('Timeout'));
+      }, this.timeout);
 
-      // A2S_INFO request packet
-      const infoPacket = Buffer.from([
-        0xFF, 0xFF, 0xFF, 0xFF, // Header
-        0x54, // A2S_INFO
-        ...Buffer.from('Source Engine Query\0', 'ascii')
-      ]);
+      try {
+        // A2S_INFO packet: 0xFF 0xFF 0xFF 0xFF 0x54 "Source Engine Query"
+        const packet = Buffer.from([
+          0xFF, 0xFF, 0xFF, 0xFF, 0x54,
+          ...Buffer.from("Source Engine Query", 'ascii'),
+          0x00
+        ]);
 
-      client.on('error', (err) => {
-        if (!resolved) {
-          resolved = true;
-          clearTimeout(timer);
-          client.close();
-          resolve({ success: false, error: err.message });
-        }
-      });
+        client.send(packet, port, ip, (err) => {
+          if (err) {
+            clearTimeout(timeout);
+            client.close();
+            reject(err);
+            return;
+          }
+        });
 
-      client.on('message', (msg) => {
-        if (!resolved) {
-          resolved = true;
-          clearTimeout(timer);
+        client.on('message', (data) => {
+          clearTimeout(timeout);
           client.close();
           
           try {
-            const result = this.parseA2SInfo(msg);
-            resolve({ success: true, data: result });
-          } catch (error) {
-            resolve({ success: false, error: error.message });
+            const parsed = this.parseServerInfo(data);
+            resolve(parsed);
+          } catch (parseErr) {
+            reject(parseErr);
           }
-        }
-      });
+        });
 
-      // Send query
-      client.send(infoPacket, port, ip, (err) => {
-        if (err && !resolved) {
-          resolved = true;
-          clearTimeout(timer);
+        client.on('error', (err) => {
+          clearTimeout(timeout);
           client.close();
-          resolve({ success: false, error: err.message });
-        }
-      });
+          reject(err);
+        });
+
+      } catch (err) {
+        clearTimeout(timeout);
+        client.close();
+        reject(err);
+      }
     });
   }
 
-  static async queryPlayers(ip, port, timeout = 5000) {
-    return new Promise((resolve) => {
+  // A2S_PLAYER query
+  async getPlayers(ip, port) {
+    return new Promise((resolve, reject) => {
       const client = dgram.createSocket('udp4');
-      let resolved = false;
-      let step = 'challenge';
-      
-      const timer = setTimeout(() => {
-        if (!resolved) {
-          resolved = true;
-          client.close();
-          resolve({ success: false, error: 'Timeout' });
-        }
-      }, timeout);
+      const timeout = setTimeout(() => {
+        client.close();
+        reject(new Error('Timeout'));
+      }, this.timeout);
 
-      // A2S_PLAYER challenge request
-      const challengePacket = Buffer.from([
-        0xFF, 0xFF, 0xFF, 0xFF, // Header
-        0x55, // A2S_PLAYER
-        0xFF, 0xFF, 0xFF, 0xFF  // Challenge
-      ]);
+      try {
+        // First, get challenge number with A2S_PLAYER challenge
+        const challengePacket = Buffer.from([
+          0xFF, 0xFF, 0xFF, 0xFF, 0x55,
+          0xFF, 0xFF, 0xFF, 0xFF // challenge
+        ]);
 
-      client.on('error', (err) => {
-        if (!resolved) {
-          resolved = true;
-          clearTimeout(timer);
-          client.close();
-          resolve({ success: false, error: err.message });
-        }
-      });
+        client.send(challengePacket, port, ip, (err) => {
+          if (err) {
+            clearTimeout(timeout);
+            client.close();
+            reject(err);
+            return;
+          }
+        });
 
-      client.on('message', (msg) => {
-        if (resolved) return;
+        let challengeReceived = false;
 
-        if (step === 'challenge') {
-          // Parse challenge response
-          if (msg.length >= 9 && msg[4] === 0x41) {
-            const challenge = msg.slice(5, 9);
+        client.on('message', (data) => {
+          if (!challengeReceived && data.length >= 9) {
+            // This is challenge response
+            challengeReceived = true;
+            const challenge = data.slice(5, 9);
             
             // Send A2S_PLAYER with challenge
             const playerPacket = Buffer.from([
-              0xFF, 0xFF, 0xFF, 0xFF, // Header
-              0x55, // A2S_PLAYER
+              0xFF, 0xFF, 0xFF, 0xFF, 0x55,
               ...challenge
             ]);
-            
-            step = 'players';
-            client.send(playerPacket, port, ip);
-          } else {
-            resolved = true;
-            clearTimeout(timer);
-            client.close();
-            resolve({ success: false, error: 'Invalid challenge response' });
-          }
-        } else if (step === 'players') {
-          resolved = true;
-          clearTimeout(timer);
-          client.close();
-          
-          try {
-            const result = this.parseA2SPlayers(msg);
-            resolve({ success: true, data: result });
-          } catch (error) {
-            resolve({ success: false, error: error.message });
-          }
-        }
-      });
 
-      // Start with challenge request
-      client.send(challengePacket, port, ip, (err) => {
-        if (err && !resolved) {
-          resolved = true;
-          clearTimeout(timer);
+            client.send(playerPacket, port, ip, (err) => {
+              if (err) {
+                clearTimeout(timeout);
+                client.close();
+                reject(err);
+              }
+            });
+          } else {
+            // This is player data response
+            clearTimeout(timeout);
+            client.close();
+            
+            try {
+              const parsed = this.parsePlayerInfo(data);
+              resolve(parsed);
+            } catch (parseErr) {
+              reject(parseErr);
+            }
+          }
+        });
+
+        client.on('error', (err) => {
+          clearTimeout(timeout);
           client.close();
-          resolve({ success: false, error: err.message });
-        }
-      });
+          reject(err);
+        });
+
+      } catch (err) {
+        clearTimeout(timeout);
+        client.close();
+        reject(err);
+      }
     });
   }
 
-  static parseA2SInfo(buffer) {
-    let offset = 5; // Skip header and type
+  parseServerInfo(data) {
+    if (data.length < 6 || data[4] !== 0x49) {
+      throw new Error('Invalid server info response');
+    }
+
+    let offset = 6; // Skip header
     
-    // Read strings and data according to A2S_INFO format
-    const name = this.readString(buffer, offset);
-    offset += name.length + 1;
-    
-    const map = this.readString(buffer, offset);
-    offset += map.length + 1;
-    
-    const folder = this.readString(buffer, offset);
-    offset += folder.length + 1;
-    
-    const game = this.readString(buffer, offset);
-    offset += game.length + 1;
-    
-    if (offset + 8 <= buffer.length) {
-      const players = buffer[offset + 2];
-      const maxPlayers = buffer[offset + 3];
+    // Read null-terminated strings
+    const readString = () => {
+      const start = offset;
+      while (offset < data.length && data[offset] !== 0) offset++;
+      const str = data.slice(start, offset).toString('utf8');
+      offset++; // Skip null terminator
+      return str;
+    };
+
+    const readByte = () => data[offset++];
+    const readShort = () => {
+      const val = data.readUInt16LE(offset);
+      offset += 2;
+      return val;
+    };
+
+    try {
+      const name = readString();
+      const map = readString();
+      const folder = readString();
+      const game = readString();
       
+      if (offset + 7 > data.length) {
+        throw new Error('Insufficient data for server info');
+      }
+
+      const appId = readShort();
+      const players = readByte();
+      const maxPlayers = readByte();
+      const bots = readByte();
+      const serverType = readByte();
+      const environment = readByte();
+
       return {
-        name,
-        map,
-        folder,
-        game,
-        players,
-        maxPlayers,
-        protocol: buffer[offset + 1],
-        serverType: String.fromCharCode(buffer[offset + 4]),
-        environment: String.fromCharCode(buffer[offset + 5])
+        name: name || 'Unknown Server',
+        map: map || 'Unknown Map',
+        game: game || 'Unknown Game',
+        players: players || 0,
+        maxPlayers: maxPlayers || 0,
+        bots: bots || 0,
+        appId: appId || 0
+      };
+    } catch (err) {
+      console.error('Error parsing server info:', err);
+      return {
+        name: 'Parse Error',
+        map: 'Unknown',
+        game: 'Unknown',
+        players: 0,
+        maxPlayers: 0,
+        bots: 0,
+        appId: 0
       };
     }
-    
-    return { name, map, folder, game, players: 0, maxPlayers: 0 };
   }
 
-  static parseA2SPlayers(buffer) {
-    if (buffer.length < 6) {
-      return { players: [] };
+  parsePlayerInfo(data) {
+    if (data.length < 6 || data[4] !== 0x44) {
+      throw new Error('Invalid player info response');
     }
 
-    const playerCount = buffer[5];
     const players = [];
-    let offset = 6;
-
-    for (let i = 0; i < playerCount && offset < buffer.length; i++) {
-      if (offset >= buffer.length) break;
+    let offset = 6; // Skip header
+    
+    try {
+      const playerCount = data[offset++];
       
-      const index = buffer[offset];
-      offset++;
-      
-      const name = this.readString(buffer, offset);
-      offset += name.length + 1;
-      
-      if (offset + 8 <= buffer.length) {
-        const score = buffer.readInt32LE(offset);
-        offset += 4;
-        const duration = buffer.readFloatLE(offset);
+      for (let i = 0; i < playerCount && offset < data.length; i++) {
+        if (offset >= data.length) break;
+        
+        const index = data[offset++];
+        
+        // Read player name (null-terminated string)
+        const nameStart = offset;
+        while (offset < data.length && data[offset] !== 0) offset++;
+        const name = data.slice(nameStart, offset).toString('utf8');
+        offset++; // Skip null terminator
+        
+        if (offset + 8 > data.length) break;
+        
+        const score = data.readInt32LE(offset);
         offset += 4;
         
-        players.push({
-          index,
-          name,
-          score,
-          duration
-        });
+        const duration = data.readFloatLE(offset);
+        offset += 4;
+        
+        if (name && name.length > 0) {
+          players.push({
+            index,
+            name: name.trim(),
+            score: score || 0,
+            duration: duration || 0
+          });
+        }
       }
+    } catch (err) {
+      console.error('Error parsing player info:', err);
     }
 
-    return { players };
-  }
-
-  static readString(buffer, offset) {
-    let end = offset;
-    while (end < buffer.length && buffer[end] !== 0) {
-      end++;
-    }
-    return buffer.slice(offset, end).toString('utf8');
+    return players;
   }
 }
 
-// API Endpoints
+// Health check endpoint
+app.get('/health', (req, res) => {
+  console.log('Health check requested');
+  res.status(200).send('UDP Relay Service is running');
+});
+
+// Query single server
 app.post('/query-server', async (req, res) => {
   const { ip, port } = req.body;
   
-  if (!ip || !port) {
-    return res.status(400).json({ error: 'IP and port required' });
-  }
-
-  console.log(`🔍 Querying server ${ip}:${port}`);
+  console.log(`Querying server: ${ip}:${port}`);
   
-  try {
-    const [serverInfo, playerInfo] = await Promise.all([
-      SourceQuery.queryServer(ip, port),
-      SourceQuery.queryPlayers(ip, port)
-    ]);
-
-    const result = {
-      serverInfo: serverInfo.success ? serverInfo.data : null,
-      players: playerInfo.success ? playerInfo.data.players : [],
-      errors: {
-        serverInfo: serverInfo.success ? null : serverInfo.error,
-        players: playerInfo.success ? null : playerInfo.error
-      }
-    };
-
-    console.log(`✅ ${ip}:${port} - Server: ${serverInfo.success ? 'OK' : 'FAIL'}, Players: ${playerInfo.success ? playerInfo.data.players.length : 'FAIL'}`);
-    
-    res.json(result);
-  } catch (error) {
-    console.error(`❌ Error querying ${ip}:${port}:`, error);
-    res.status(500).json({ error: error.message });
+  if (!ip || !port) {
+    return res.status(400).json({ error: 'IP and port are required' });
   }
+
+  const query = new SourceQuery(3000);
+  const result = {
+    ip,
+    port,
+    serverInfo: null,
+    players: null,
+    errors: {}
+  };
+
+  try {
+    console.log(`Getting server info for ${ip}:${port}`);
+    result.serverInfo = await query.getServerInfo(ip, port);
+    console.log(`Server info success: ${result.serverInfo.players}/${result.serverInfo.maxPlayers} players`);
+  } catch (err) {
+    console.log(`Server info failed for ${ip}:${port}: ${err.message}`);
+    result.errors.serverInfo = err.message;
+  }
+
+  try {
+    console.log(`Getting players for ${ip}:${port}`);
+    result.players = await query.getPlayers(ip, port);
+    console.log(`Players success: ${result.players.length} players found`);
+  } catch (err) {
+    console.log(`Players failed for ${ip}:${port}: ${err.message}`);
+    result.errors.players = err.message;
+  }
+
+  res.json(result);
 });
 
+// Query multiple servers
 app.post('/query-batch', async (req, res) => {
   const { servers } = req.body;
   
+  console.log(`Batch query for ${servers.length} servers`);
+  
   if (!Array.isArray(servers)) {
-    return res.status(400).json({ error: 'Servers array required' });
+    return res.status(400).json({ error: 'Servers array is required' });
   }
 
-  console.log(`🔍 Batch querying ${servers.length} servers`);
-  
+  const query = new SourceQuery(3000);
   const results = [];
-  
-  // Process in parallel but with concurrency limit
-  const concurrency = 10;
-  for (let i = 0; i < servers.length; i += concurrency) {
-    const batch = servers.slice(i, i + concurrency);
-    
-    const batchPromises = batch.map(async (server) => {
-      const [serverInfo, playerInfo] = await Promise.all([
-        SourceQuery.queryServer(server.ip, server.port),
-        SourceQuery.queryPlayers(server.ip, server.port)
-      ]);
 
-      return {
+  // Process servers in parallel but limit concurrency
+  const BATCH_SIZE = 5;
+  for (let i = 0; i < servers.length; i += BATCH_SIZE) {
+    const batch = servers.slice(i, i + BATCH_SIZE);
+    const batchPromises = batch.map(async (server) => {
+      const result = {
         id: server.id,
         ip: server.ip,
         port: server.port,
-        serverInfo: serverInfo.success ? serverInfo.data : null,
-        players: playerInfo.success ? playerInfo.data.players : [],
-        errors: {
-          serverInfo: serverInfo.success ? null : serverInfo.error,
-          players: playerInfo.success ? null : playerInfo.error
-        }
+        serverInfo: null,
+        players: null,
+        errors: {}
       };
+
+      try {
+        console.log(`Batch: Getting server info for ${server.ip}:${server.port}`);
+        result.serverInfo = await query.getServerInfo(server.ip, server.port);
+      } catch (err) {
+        console.log(`Batch: Server info failed for ${server.ip}:${server.port}: ${err.message}`);
+        result.errors.serverInfo = err.message;
+      }
+
+      try {
+        console.log(`Batch: Getting players for ${server.ip}:${server.port}`);
+        result.players = await query.getPlayers(server.ip, server.port);
+      } catch (err) {
+        console.log(`Batch: Players failed for ${server.ip}:${server.port}: ${err.message}`);
+        result.errors.players = err.message;
+      }
+
+      return result;
     });
 
     const batchResults = await Promise.all(batchPromises);
     results.push(...batchResults);
     
-    console.log(`✅ Processed batch ${Math.floor(i/concurrency) + 1}/${Math.ceil(servers.length/concurrency)}`);
-    
-    // Small delay between batches
-    if (i + concurrency < servers.length) {
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
+    console.log(`Completed batch ${Math.floor(i/BATCH_SIZE) + 1}/${Math.ceil(servers.length/BATCH_SIZE)}`);
   }
 
+  console.log(`Batch query complete: ${results.length} servers processed`);
   res.json({ results });
 });
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 UDP Relay Service running on port ${PORT}`);
-  console.log(`📡 Ready to query Rust servers with real UDP connections`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`UDP Relay Service running on port ${PORT}`);
+  console.log(`Health check: http://localhost:${PORT}/health`);
 });
 
-module.exports = app;
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received, shutting down gracefully');
+  process.exit(0);
+});
